@@ -1,43 +1,141 @@
-# Decoupled Architecture for Privacy-Compliant Recommendation
+# Decoupled Architecture for Privacy-Compliant Recommendation ```
 
-## Overview
-This repository implements a decoupled recommender system to address the "Right to be Forgotten" in production environments. Standard deep learning models (like monolithic Transformers) mix user and item data, which makes deleting a single user impossible without retraining the entire model.
+This repository implements a decoupled recommender system designed to address the "Right to be Forgotten" in production environments. Standard deep learning architectures (such as monolithic Transformers) entangle user and item representations, which makes removing a single user impossible without retraining the entire model. This project separates item learning from user history processing at the architectural level, so a user can be removed from the system by discarding their local parameters while the central item model remains untouched.
 
-This project uses a **Decoupled Architecture** that physically separates item learning from user history processing. This separation allows for the effective removal of user data by discarding local parameters while keeping the global item model intact.
+---
+
+## Folder Structure
+
+```
+decoupled--privacy-recommender/
+├── 01_DataPrep_Weights.ipynb
+├── 02_Cloud_Item_Tower_Training.ipynb
+├── 03_SASRec_Training.ipynb
+├── 04_Evaluation.ipynb
+├── final_utility_chart.png
+├── final_privacy_chart.png
+├── LICENSE
+└── README.md
+```
+---
 
 ## System Architecture
-The solution combines **Neural Collaborative Filtering (NCF)** and **Self-Attentive Sequential Recommendation (SASRec)**:
 
-1.  **Item Tower (Cloud / Public):** A Two-Tower network trains on global interactions to learn item-to-item compatibility. These embeddings are extracted and **frozen**, preventing user-specific gradients from leaking into the central model.
-2.  **User Tower (Edge / Private):** A local Adapter Layer (Linear-ReLU-Linear) projects the frozen item embeddings into a latent space for a SASRec Transformer, which learns sequential history locally.
+The pipeline consists of two structurally isolated components:
 
-## Data & Methodology
-* **Dataset:** KuaiRec 2.0 (Filtered for positive interactions with `watch_ratio` ≥ 1.0).
-* **Debiasing:** Applied Inverse Propensity Weighting (IPW) during training to fix popularity bias and ensure niche content representation.
-* **Validation Method:** **Exact Retraining**. To verify the unlearning, we trained two distinct models from scratch: a "Baseline" (containing all users) and an "Unlearned Model" (excluding the target user). This provides a mathematical ground truth for evaluation.
+- **Item Tower (Cloud / Public):** A Two-Tower network trained on global, anonymized interactions to produce item embeddings. Weights are extracted and frozen as a static `.npy` file, preventing any user-specific gradients from propagating into the central model.
+- **User Tower (Edge / Private):** A local Adapter Layer (Linear → ReLU → Linear) projects frozen item embeddings into a dynamic latent space, which feeds a SASRec Transformer [4] that models each user's sequential interaction history locally.
 
-## Evaluation Results
+To remove a user, only their local adapter parameters are discarded. The central Item Tower requires no modification.
 
-### 1. General Utility (Hit Rate @ 10)
-Impact on the general user base was measured using Hit Rate @ 10 on a held-out test set.
+---
 
-![Utility Chart](final_utility_chart.png)
-*Figure 1: Comparison of recommendation quality. The unlearned model demonstrates stable utility (0.0260) compared to the baseline (0.0240), confirming that unlearning a user does not degrade system performance for the remaining population.*
+## Methodology
 
-### 2. Privacy Verification (Cross Entropy Loss)
-Erasure was verified by calculating Cross Entropy Loss on the target user's historical training sequences. A spike in loss indicates the model has lost its predictive capability for that specific user.
+### Data Preparation (`01_DataPrep_Weights.ipynb`)
+- **Dataset:** KuaiRec 2.0 [2] is a fully observed, dense short-video interaction dataset (`big_matrix.csv` + `item_categories.csv`).
+- Filtered for positive engagement: interactions with `watch_ratio ≥ 1.0` only.
+- User IDs, Video IDs, and Category IDs remapped to consecutive integers via `LabelEncoder`. Final dataset: **7,176 users × 10,719 items**.
+- Interaction sequences sorted chronologically per user. **Leave-One-Out** split: last item held out as test target.
+- **Inverse Propensity Weighting (IPW)** [3] applied to counteract popularity bias. Weights assign higher training importance to niche items (~4.38) and lower importance to viral items (~0.06):
 
-![Privacy Chart](final_privacy_chart.png)
-*Figure 2: Privacy verification. The sharp increase in loss (3.61 → 8.32) for the unlearned model confirms the effective removal of the user's data patterns, approaching random guessing levels.*
+$$W_{\text{item}} = \text{Normalize}\left(\frac{1}{P(\text{item})^{0.5}}\right)$$
 
-## Repository Structure
+### Item Tower Training (`02_Cloud_Item_Tower_Training.ipynb`)
+- Two-Tower model with User, Item, and Category embedding layers. Item and Category embeddings combined via element-wise addition; dot product with User embedding predicts interaction probability.
+- Dynamic negative sampling: for each positive `(User, Item)` pair, one un-interacted item sampled per training step.
+- Trained for **5 epochs** with Adam optimizer and IPW-weighted Binary Cross Entropy loss. Final training loss converged to ~**0.0005**.
+- Item embedding matrix extracted and saved as `frozen_item_embeddings.npy` — physically detached from the PyTorch computational graph.
 
-* `01_Data_Prep_Debiasing.ipynb`: Data preprocessing, sequence generation, and calculation of Inverse Propensity Weights (IPW).
-* `02_Cloud_Item_Tower.ipynb`: Training of the Two-Tower candidate generation model and extraction of the frozen item embedding matrix.
-* `03_Edge_SASRec_Training.ipynb`: Implementation of the Adapter Layer and SASRec Transformer. Execution of the "Exact Retraining" simulation (Baseline vs. Unlearned models).
-* `04_Evaluation.ipynb`: Calculation of Utility (HR@10) and Privacy (Cross Entropy) metrics, and generation of visualization charts.
+### SASRec Training (`03_SASRec_Training.ipynb`)
+- Frozen embeddings loaded as a static lookup table (`freeze=True`).
+- Adapter Layer projects static embeddings into the sequential attention space.
+- Positional embeddings added to preserve interaction order within the Transformer.
+- Training config: `MAX_LEN=100`, `STEP_SIZE=10` (sliding window augmentation), `BATCH_SIZE=128`, `LR=0.001`, `EPOCHS=10`. Cross Entropy loss with `ignore_index=0` to exclude padding tokens.
+- **Exact Retraining** used for unlearning verification [5]: two models trained from scratch — **Baseline** (all users) and **Unlearned** (target user excluded). Both converged from ~8.11 to ~7.90 by Epoch 10, confirming one user's removal does not destabilize training.
 
-## References
-1.  **KuaiRec Dataset:** Gao, C., et al. (2022). "KuaiRec: A Fully-Observed Dataset...". CIKM.
-2.  **IPW:** Schnabel, T., et al. (2016). "Recommendations as Treatments: Debiasing Learning and Evaluation". ICML.
-3.  **SASRec:** Kang, W. C., & McAuley, J. (2018). "Self-Attentive Sequential Recommendation". ICDM.
+### Evaluation (`04_Evaluation.ipynb`)
+- **Utility:** Hit Rate@10 on held-out test targets for all non-forgotten users.
+- **Privacy:** Cross Entropy Loss computed on the forgotten user's (User 4247) original training history. A high loss indicates the model can no longer predict that user's behavior — approximating random guessing.
+
+---
+
+## Results
+
+### Utility — Hit Rate @ 10
+
+| Model | Hit Rate @ 10 |
+| :--- | :---: |
+| Baseline (all users) | 0.0240 |
+| **Unlearned (user removed)** | **0.0260** |
+
+The unlearned model maintains and marginally exceeds baseline recommendation quality for the remaining user population, confirming the global Item Tower is sufficiently general.
+
+<p align="center">
+  <img src="final_utility_chart.png" width="480"/>
+  <br><em>Figure 1: Hit Rate@10 comparison. Unlearning a single user has no negative impact on general system utility.</em>
+</p>
+
+### Privacy — Cross Entropy Loss on Forgotten User
+
+| Model | Cross Entropy Loss |
+| :--- | :---: |
+| Baseline (remembers user) | 3.6130 |
+| **Unlearned (user erased)** | **8.3252** |
+
+The mathematical upper bound for random guessing on this dataset is ln(10,719) ≈ **9.22**. The unlearned model's loss of 8.33 approaches this limit, confirming effective erasure of the user's behavioral patterns.
+
+<p align="center">
+  <img src="final_privacy_chart.png" width="480"/>
+  <br><em>Figure 2: Cross Entropy Loss on the forgotten user's history. The sharp increase in the unlearned model confirms data erasure approaching random-guess levels.</em>
+</p>
+
+> **Note on absolute accuracy:** The system's Hit@10 (~2.6%) is lower than fully end-to-end trained transformers. Freezing item embeddings prevents joint optimization of user and item representations which is a deliberate privacy constraint. Closing this gap without compromising the privacy mechanism is a direction for future work.
+
+---
+
+## Reproduction
+
+### Requirements
+
+```bash
+pip install torch numpy pandas scikit-learn
+```
+
+A **Google Colab Pro** environment with GPU runtime is recommended.
+
+### Steps
+
+1. Download [KuaiRec 2.0](https://kuairec.com/) and place `big_matrix.csv` and `item_categories.csv` in the project root.
+2. Run notebooks in order:
+   - `01_DataPrep_Weights.ipynb` —> generates processed sequences and IPW weights.
+   - `02_Cloud_Item_Tower_Training.ipynb` —> trains the Item Tower and exports `frozen_item_embeddings.npy`.
+   - `03_SASRec_Training.ipynb` —> trains Baseline and Unlearned SASRec models.
+   - `04_Evaluation.ipynb` —> computes Hit Rate@10 and Cross Entropy metrics and generates charts.
+
+---
+
+## Citation
+
+If you reference this work, please cite as:
+
+Aygün, E. (2026). Decoupled Collaborative Filtering for Privacy-Compliant Video Recommendation. https://github.com/fukichime/decoupled--privacy-recommender.git
+
+---
+
+
+### References
+
+[1] C. Chen et al., "Recommendation Unlearning," in Proc. NeurIPS, 2023.
+
+[2] C. Gao et al., "KuaiRec: A Fully-Observed Dataset and Insights for Evaluating
+Recommender Systems," in Proc. CIKM, 2022. https://kuairec.com/
+
+[3] T. Schnabel et al., "Recommendations as Treatments: Debiasing Learning
+and Evaluation," in Proc. ICML, 2016.
+
+[4] W.-C. Kang and J. McAuley, "Self-Attentive Sequential Recommendation,"
+in Proc. ICDM, 2018.
+
+[5] T. T. Nguyen et al., "A Survey of Machine Unlearning,"
+arXiv preprint arXiv:2209.02299, 2022.
